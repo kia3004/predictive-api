@@ -5,3 +5,4 @@ numpy
 mysql-connector-python
 statsmodels
 scikit-learn
+reportlab
