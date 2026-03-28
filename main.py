@@ -16,6 +16,21 @@ from statsmodels.tsa.arima.model import ARIMA
 app = FastAPI()
 
 
+DISEASE_READINESS_PROFILE = {
+    "scope": "disease",
+    "min_daily_points": 60,
+    "min_non_zero_days": 20,
+    "min_total_cases": 30,
+}
+
+BARANGAY_DISEASE_READINESS_PROFILE = {
+    "scope": "barangay_disease",
+    "min_daily_points": 45,
+    "min_non_zero_days": 15,
+    "min_total_cases": 20,
+}
+
+
 def get_connection():
     return mysql.connector.connect(
         host=os.getenv("MYSQL_HOST", "centerbeam.proxy.rlwy.net"),
@@ -60,18 +75,64 @@ def build_barangay_expression(household_columns):
     return "'Unknown'"
 
 
+def resolve_health_data_source(conn):
+    health_table = get_existing_table_name(conn, ["healthrecords", "health_records"])
+    household_table = get_existing_table_name(conn, ["households", "household"])
+
+    if not health_table or not household_table:
+        raise HTTPException(status_code=500, detail="Required health data tables were not found.")
+
+    health_columns = get_table_columns(conn, health_table)
+    household_columns = get_table_columns(conn, household_table)
+    barangay_expression = build_barangay_expression(household_columns)
+
+    if "HouseholdID" in health_columns:
+        join_clause = f"""
+            INNER JOIN `{household_table}` h
+                ON hr.HouseholdID = h.HouseholdID
+        """
+        return barangay_expression, join_clause
+
+    if "PatientID" in health_columns:
+        member_table = get_existing_table_name(conn, ["household_members", "householdmembers"])
+        if not member_table:
+            raise HTTPException(
+                status_code=500,
+                detail="Health records use PatientID, but the household member table was not found.",
+            )
+
+        member_columns = get_table_columns(conn, member_table)
+        member_key = "PatientID" if "PatientID" in member_columns else "MemberID" if "MemberID" in member_columns else None
+
+        if not member_key or "HouseholdID" not in member_columns:
+            raise HTTPException(
+                status_code=500,
+                detail="No compatible patient-to-household mapping columns were found.",
+            )
+
+        join_clause = f"""
+            INNER JOIN `{member_table}` hm
+                ON hr.PatientID = hm.`{member_key}`
+            INNER JOIN `{household_table}` h
+                ON hm.HouseholdID = h.HouseholdID
+        """
+        return barangay_expression, join_clause
+
+    raise HTTPException(
+        status_code=500,
+        detail="Health records do not expose a compatible HouseholdID or PatientID column.",
+    )
+
+
 def get_data(barangay_name: str | None = None, disease_name: str | None = None):
     conn = get_connection()
 
     try:
         health_table = get_existing_table_name(conn, ["healthrecords", "health_records"])
-        household_table = get_existing_table_name(conn, ["households", "household"])
-
-        if not health_table or not household_table:
+        if not health_table:
             raise HTTPException(status_code=500, detail="Required health data tables were not found.")
 
-        household_columns = get_table_columns(conn, household_table)
-        barangay_expression = build_barangay_expression(household_columns)
+        barangay_expression, join_clause = resolve_health_data_source(conn)
 
         query = f"""
             SELECT
@@ -80,8 +141,7 @@ def get_data(barangay_name: str | None = None, disease_name: str | None = None):
                 {barangay_expression} AS Barangay,
                 COUNT(*) AS Cases
             FROM `{health_table}` hr
-            INNER JOIN `{household_table}` h
-                ON hr.HouseholdID = h.HouseholdID
+            {join_clause}
             WHERE TRIM(hr.Disease) <> ''
         """
 
@@ -138,19 +198,66 @@ def build_time_series(filtered_data: pd.DataFrame):
     return daily_cases.asfreq("D").fillna(0)
 
 
-def build_prediction_result(ts: pd.Series, disease_name: str, barangay_name: str | None = None, forecast_days: int = 7):
+def summarize_time_series(ts: pd.Series):
+    return {
+        "daily_points": int(len(ts)),
+        "non_zero_days": int((ts > 0).sum()),
+        "total_cases": int(ts.sum()),
+    }
+
+
+def build_readiness_error(readiness_profile, metrics, disease_name: str, barangay_name: str | None = None):
+    scope_label = "disease/barangay" if barangay_name else "disease"
+    location_label = f" in {barangay_name}" if barangay_name else ""
+
+    return {
+        "error": f"Insufficient data for reliable {scope_label} prediction for {disease_name}{location_label}",
+        "current_data": metrics,
+        "required_minimum": {
+            "daily_points": readiness_profile["min_daily_points"],
+            "non_zero_days": readiness_profile["min_non_zero_days"],
+            "total_cases": readiness_profile["min_total_cases"],
+        },
+        "scope": readiness_profile["scope"],
+    }
+
+
+def validate_prediction_readiness(ts: pd.Series, readiness_profile, disease_name: str, barangay_name: str | None = None):
+    metrics = summarize_time_series(ts)
+
+    if (
+        metrics["daily_points"] < readiness_profile["min_daily_points"]
+        or metrics["non_zero_days"] < readiness_profile["min_non_zero_days"]
+        or metrics["total_cases"] < readiness_profile["min_total_cases"]
+    ):
+        return build_readiness_error(readiness_profile, metrics, disease_name, barangay_name)
+
+    return None
+
+
+def build_prediction_result(
+    ts: pd.Series,
+    disease_name: str,
+    barangay_name: str | None = None,
+    forecast_days: int = 7,
+    readiness_profile=None,
+):
     if ts.empty:
         return {"error": "No data found for this request"}
 
-    if len(ts) < 10:
-        return {"error": "Not enough data for prediction"}
+    readiness_profile = readiness_profile or DISEASE_READINESS_PROFILE
+    readiness_error = validate_prediction_readiness(ts, readiness_profile, disease_name, barangay_name)
+    if readiness_error:
+        return readiness_error
+
+    metrics = summarize_time_series(ts)
 
     train_size = int(len(ts) * 0.8)
     train = ts.iloc[:train_size]
     test = ts.iloc[train_size:]
 
     if train.empty or test.empty:
-        return {"error": "Not enough data for prediction"}
+        return {"error": "Not enough data to split into train and test windows"}
 
     try:
         model_fit = ARIMA(train, order=(2, 1, 2)).fit()
@@ -205,6 +312,7 @@ def build_prediction_result(ts: pd.Series, disease_name: str, barangay_name: str
         "confidence_ratio": confidence_ratio,
         "mae": round(float(mae), 2),
         "rmse": round(rmse, 2),
+        "data_summary": metrics,
     }
 
     if barangay_name:
@@ -225,7 +333,12 @@ def predict_disease(data: pd.DataFrame, disease_name: str, forecast_days: int = 
 
     series = build_time_series(disease_data)
     matched_disease = disease_data["Disease"].iloc[0]
-    return build_prediction_result(series, matched_disease, forecast_days=forecast_days)
+    return build_prediction_result(
+        series,
+        matched_disease,
+        forecast_days=forecast_days,
+        readiness_profile=DISEASE_READINESS_PROFILE,
+    )
 
 
 def predict_barangay_disease(data: pd.DataFrame, barangay_name: str, disease_name: str, forecast_days: int = 7):
@@ -246,7 +359,13 @@ def predict_barangay_disease(data: pd.DataFrame, barangay_name: str, disease_nam
     series = build_time_series(filtered_data)
     matched_barangay = filtered_data["Barangay"].iloc[0]
     matched_disease = filtered_data["Disease"].iloc[0]
-    return build_prediction_result(series, matched_disease, matched_barangay, forecast_days)
+    return build_prediction_result(
+        series,
+        matched_disease,
+        matched_barangay,
+        forecast_days,
+        readiness_profile=BARANGAY_DISEASE_READINESS_PROFILE,
+    )
 
 
 def save_prediction_to_db(prediction_result):
