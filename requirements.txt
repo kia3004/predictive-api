@@ -3,6 +3,7 @@ uvicorn
 pandas
 numpy
 mysql-connector-python
+SQLAlchemy
 statsmodels
 scikit-learn
 reportlab
