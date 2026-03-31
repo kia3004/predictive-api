@@ -1,589 +1,189 @@
 from datetime import datetime
-from io import BytesIO
-import os
-import re
-
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException
 import mysql.connector
 import numpy as np
 import pandas as pd
-from reportlab.lib.pagesizes import LETTER
-from reportlab.pdfgen import canvas
-from sklearn.metrics import mean_absolute_error
-from statsmodels.tsa.arima.model import ARIMA
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 app = FastAPI()
 
-
-DISEASE_READINESS_PROFILE = {
-    "scope": "disease",
-    "min_daily_points": 60,
-    "min_non_zero_days": 20,
-    "min_total_cases": 30,
-}
-
-BARANGAY_DISEASE_READINESS_PROFILE = {
-    "scope": "barangay_disease",
-    "min_daily_points": 45,
-    "min_non_zero_days": 15,
-    "min_total_cases": 20,
-}
-
-
+# =========================================================
+# DATABASE
+# =========================================================
 def get_connection():
     return mysql.connector.connect(
-        host=os.getenv("MYSQL_HOST", "centerbeam.proxy.rlwy.net"),
-        port=int(os.getenv("MYSQL_PORT", "38661")),
-        user=os.getenv("MYSQL_USER", "phimas_user"),
-        password=os.getenv("MYSQL_PASSWORD", "Phimas123!"),
-        database=os.getenv("MYSQL_DATABASE", "railway"),
+        host="centerbeam.proxy.rlwy.net",
+        port=38661,
+        user="phimas_user",
+        password="Phimas123!",
+        database="railway",
     )
 
-
-def get_existing_table_name(conn, candidates):
-    cursor = conn.cursor()
-
-    try:
-        for table_name in candidates:
-            cursor.execute("SHOW TABLES LIKE %s", (table_name,))
-            if cursor.fetchone():
-                return table_name
-    finally:
-        cursor.close()
-
-    return None
-
-
-def get_table_columns(conn, table_name):
-    cursor = conn.cursor(dictionary=True)
-
-    try:
-        cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
-        return {row["Field"] for row in cursor.fetchall()}
-    finally:
-        cursor.close()
-
-
-def build_barangay_expression(household_columns):
-    if "Barangay" in household_columns:
-        return "COALESCE(NULLIF(TRIM(h.Barangay), ''), NULLIF(TRIM(SUBSTRING_INDEX(h.Address, ',', 1)), ''), 'Unknown')"
-
-    if "Address" in household_columns:
-        return "COALESCE(NULLIF(TRIM(SUBSTRING_INDEX(h.Address, ',', 1)), ''), 'Unknown')"
-
-    return "'Unknown'"
-
-
-def resolve_health_data_source(conn):
-    health_table = get_existing_table_name(conn, ["healthrecords", "health_records"])
-    household_table = get_existing_table_name(conn, ["households", "household"])
-
-    if not health_table or not household_table:
-        raise HTTPException(status_code=500, detail="Required health data tables were not found.")
-
-    health_columns = get_table_columns(conn, health_table)
-    household_columns = get_table_columns(conn, household_table)
-    barangay_expression = build_barangay_expression(household_columns)
-
-    if "HouseholdID" in health_columns:
-        join_clause = f"""
-            INNER JOIN `{household_table}` h
-                ON hr.HouseholdID = h.HouseholdID
-        """
-        return barangay_expression, join_clause
-
-    if "PatientID" in health_columns:
-        member_table = get_existing_table_name(conn, ["household_members", "householdmembers"])
-        if not member_table:
-            raise HTTPException(
-                status_code=500,
-                detail="Health records use PatientID, but the household member table was not found.",
-            )
-
-        member_columns = get_table_columns(conn, member_table)
-        member_key = "PatientID" if "PatientID" in member_columns else "MemberID" if "MemberID" in member_columns else None
-
-        if not member_key or "HouseholdID" not in member_columns:
-            raise HTTPException(
-                status_code=500,
-                detail="No compatible patient-to-household mapping columns were found.",
-            )
-
-        join_clause = f"""
-            INNER JOIN `{member_table}` hm
-                ON hr.PatientID = hm.`{member_key}`
-            INNER JOIN `{household_table}` h
-                ON hm.HouseholdID = h.HouseholdID
-        """
-        return barangay_expression, join_clause
-
-    raise HTTPException(
-        status_code=500,
-        detail="Health records do not expose a compatible HouseholdID or PatientID column.",
-    )
-
-
-def get_data(barangay_name: str | None = None, disease_name: str | None = None):
+# =========================================================
+# LOAD DATA
+# =========================================================
+def get_data():
     conn = get_connection()
 
-    try:
-        health_table = get_existing_table_name(conn, ["healthrecords", "health_records"])
-        if not health_table:
-            raise HTTPException(status_code=500, detail="Required health data tables were not found.")
+    query = """
+        SELECT 
+            DATE(hr.DateRecorded) as DateRecorded,
+            hr.Disease,
+            COALESCE(h.Address, 'Unknown') as Address,
+            COUNT(*) as Cases
+        FROM health_records hr
+        LEFT JOIN households h ON hr.HouseholdID = h.HouseholdID
+        GROUP BY DateRecorded, hr.Disease, Address
+        ORDER BY DateRecorded
+    """
 
-        barangay_expression, join_clause = resolve_health_data_source(conn)
+    df = pd.read_sql(query, conn)
+    conn.close()
 
-        query = f"""
-            SELECT
-                DATE(hr.DateRecorded) AS DateRecorded,
-                TRIM(hr.Disease) AS Disease,
-                {barangay_expression} AS Barangay,
-                COUNT(*) AS Cases
-            FROM `{health_table}` hr
-            {join_clause}
-            WHERE TRIM(hr.Disease) <> ''
-        """
+    df["DateRecorded"] = pd.to_datetime(df["DateRecorded"])
+    df["Barangay"] = df["Address"].str.split(",").str[0]
 
-        params = []
+    return df
 
-        if disease_name:
-            query += " AND LOWER(TRIM(hr.Disease)) = LOWER(%s)"
-            params.append(disease_name.strip())
+# =========================================================
+# BUILD ML DATASET
+# =========================================================
+def build_ml_dataset(data):
+    df = data.copy()
 
-        if barangay_name:
-            query += f" AND LOWER({barangay_expression}) = LOWER(%s)"
-            params.append(barangay_name.strip())
+    df = df.sort_values(["Disease","Barangay","DateRecorded"])
 
-        query += f"""
-            GROUP BY
-                DATE(hr.DateRecorded),
-                TRIM(hr.Disease),
-                {barangay_expression}
-            ORDER BY
-                DATE(hr.DateRecorded),
-                TRIM(hr.Disease),
-                {barangay_expression}
-        """
+    g = df.groupby(["Disease","Barangay"])
 
-        cursor = conn.cursor(dictionary=True)
-        try:
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-        finally:
-            cursor.close()
-    finally:
-        conn.close()
+    df["Lag1"] = g["Cases"].shift(1)
+    df["Lag2"] = g["Cases"].shift(2)
+    df["Lag3"] = g["Cases"].shift(3)
 
-    if not rows:
-        return pd.DataFrame(columns=["DateRecorded", "Disease", "Barangay", "Cases"])
+    df["Target"] = g["Cases"].shift(-1)
 
-    data = pd.DataFrame(rows)
-    data["DateRecorded"] = pd.to_datetime(data["DateRecorded"])
-    data["Cases"] = pd.to_numeric(data["Cases"], errors="coerce").fillna(0)
-    data["Disease"] = data["Disease"].astype(str).str.strip()
-    data["Barangay"] = data["Barangay"].astype(str).str.strip()
+    df["Month"] = df["DateRecorded"].dt.month
+    df["Day"] = df["DateRecorded"].dt.day
+    df["DayOfWeek"] = df["DateRecorded"].dt.dayofweek
 
-    return data
+    df = df.dropna()
 
+    return df
 
-def build_time_series(filtered_data: pd.DataFrame):
-    daily_cases = (
-        filtered_data.groupby("DateRecorded", as_index=True)["Cases"]
-        .sum()
-        .sort_index()
-    )
+# =========================================================
+# TRAIN MODEL
+# =========================================================
+def train_model():
+    data = get_data()
+    dataset = build_ml_dataset(data)
 
-    daily_cases.index = pd.DatetimeIndex(daily_cases.index)
-    return daily_cases.asfreq("D").fillna(0)
+    X = dataset[[
+        "Disease","Barangay",
+        "Lag1","Lag2","Lag3",
+        "Month","Day","DayOfWeek"
+    ]]
+    
+    y = dataset["Target"]
 
+    preprocessor = ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown='ignore'), ["Disease","Barangay"]),
+        ("num", StandardScaler(), ["Lag1","Lag2","Lag3","Month","Day","DayOfWeek"])
+    ])
 
-def summarize_time_series(ts: pd.Series):
-    return {
-        "daily_points": int(len(ts)),
-        "non_zero_days": int((ts > 0).sum()),
-        "total_cases": int(ts.sum()),
-    }
+    model = Pipeline([
+        ("prep", preprocessor),
+        ("model", RandomForestRegressor(n_estimators=100))
+    ])
 
+    model.fit(X, y)
+    return model
 
-def build_readiness_error(readiness_profile, metrics, disease_name: str, barangay_name: str | None = None):
-    scope_label = "disease/barangay" if barangay_name else "disease"
-    location_label = f" in {barangay_name}" if barangay_name else ""
+# =========================================================
+# LOAD MODEL ON STARTUP
+# =========================================================
+print("Training ML model...")
+ml_model = train_model()
+print("Model ready!")
 
-    return {
-        "error": f"Insufficient data for reliable {scope_label} prediction for {disease_name}{location_label}",
-        "current_data": metrics,
-        "required_minimum": {
-            "daily_points": readiness_profile["min_daily_points"],
-            "non_zero_days": readiness_profile["min_non_zero_days"],
-            "total_cases": readiness_profile["min_total_cases"],
-        },
-        "scope": readiness_profile["scope"],
-    }
+# =========================================================
+# PREDICTION FUNCTION
+# =========================================================
+def predict_cases(ts, disease_name, barangay_name=None, forecast_days=7):
 
-
-def validate_prediction_readiness(ts: pd.Series, readiness_profile, disease_name: str, barangay_name: str | None = None):
-    metrics = summarize_time_series(ts)
-
-    if (
-        metrics["daily_points"] < readiness_profile["min_daily_points"]
-        or metrics["non_zero_days"] < readiness_profile["min_non_zero_days"]
-        or metrics["total_cases"] < readiness_profile["min_total_cases"]
-    ):
-        return build_readiness_error(readiness_profile, metrics, disease_name, barangay_name)
-
-    return None
-
-
-def build_prediction_result(
-    ts: pd.Series,
-    disease_name: str,
-    barangay_name: str | None = None,
-    forecast_days: int = 7,
-    readiness_profile=None,
-):
     if ts.empty:
-        return {"error": "No data found for this request"}
+        return {"error": "No data"}
 
-    readiness_profile = readiness_profile or DISEASE_READINESS_PROFILE
-    readiness_error = validate_prediction_readiness(ts, readiness_profile, disease_name, barangay_name)
-    if readiness_error:
-        return readiness_error
+    forecast_values = []
 
-    metrics = summarize_time_series(ts)
+    working = ts.reset_index()
+    working.columns = ["DateRecorded","Cases"]
 
-    train_size = int(len(ts) * 0.8)
-    train = ts.iloc[:train_size]
-    test = ts.iloc[train_size:]
+    for i in range(forecast_days):
+        last = working.tail(3)
 
-    if train.empty or test.empty:
-        return {"error": "Not enough data to split into train and test windows"}
+        if len(last) < 3:
+            return {"error": "Not enough data"}
 
-    try:
-        model_fit = ARIMA(train, order=(2, 1, 2)).fit()
-        test_forecast = model_fit.forecast(steps=len(test))
+        lag1 = last.iloc[-1]["Cases"]
+        lag2 = last.iloc[-2]["Cases"]
+        lag3 = last.iloc[-3]["Cases"]
 
-        mae = mean_absolute_error(test, test_forecast)
-        rmse = float(np.sqrt(((test - test_forecast) ** 2).mean()))
+        new_data = pd.DataFrame([{
+            "Disease": disease_name,
+            "Barangay": barangay_name if barangay_name else "Unknown",
+            "Lag1": lag1,
+            "Lag2": lag2,
+            "Lag3": lag3,
+            "Month": datetime.now().month,
+            "Day": datetime.now().day,
+            "DayOfWeek": datetime.now().weekday()
+        }])
 
-        final_model = ARIMA(ts, order=(2, 1, 2)).fit()
-        forecast = final_model.forecast(steps=forecast_days)
-    except Exception as exc:
-        return {"error": f"Prediction failed: {exc}"}
+        pred = ml_model.predict(new_data)[0]
+        pred = max(0, round(pred, 2))
 
-    forecast = pd.Series(np.maximum(forecast, 0), index=forecast.index)
-    forecast_values = [round(float(value), 2) for value in forecast.tolist()]
-    forecast_dates = [index.strftime("%Y-%m-%d") for index in forecast.index]
+        forecast_values.append(pred)
 
-    average_cases = float(ts.mean())
+        working = pd.concat([
+            working,
+            pd.DataFrame([{
+                "DateRecorded": datetime.now(),
+                "Cases": pred
+            }])
+        ])
 
-    def risk_score(value):
-        if value > average_cases * 1.5:
-            return "High"
-        if value > average_cases:
-            return "Medium"
-        return "Low"
+    return forecast_values
 
-    risk_levels = [risk_score(value) for value in forecast_values]
-    risk_priority = {"Low": 1, "Medium": 2, "High": 3}
-    overall_risk_level = max(risk_levels, key=lambda level: risk_priority[level], default="Low")
+# =========================================================
+# API ENDPOINT
+# =========================================================
+@app.get("/predict")
+def predict(disease: str, barangay: str = None):
 
-    first_value = forecast_values[0]
-    last_value = forecast_values[-1]
-    if last_value > first_value:
-        trend = "Increasing"
-    elif last_value < first_value:
-        trend = "Decreasing"
-    else:
-        trend = "Stable"
-
-    confidence_percent = max(0.0, min(100.0, 100 - (rmse * 5)))
-    confidence_ratio = round(confidence_percent / 100, 4)
-
-    result = {
-        "disease": disease_name,
-        "forecast": forecast_values,
-        "forecast_dates": forecast_dates,
-        "risk_levels": risk_levels,
-        "overall_risk_level": overall_risk_level,
-        "trend": trend,
-        "predicted_cases": int(round(sum(forecast_values))),
-        "confidence_score": round(confidence_percent, 2),
-        "confidence_ratio": confidence_ratio,
-        "mae": round(float(mae), 2),
-        "rmse": round(rmse, 2),
-        "data_summary": metrics,
-    }
-
-    if barangay_name:
-        result["barangay"] = barangay_name
-
-    return result
-
-
-def predict_disease(data: pd.DataFrame, disease_name: str, forecast_days: int = 7):
-    if data.empty:
-        return {"error": "No data found for this disease"}
-
-    disease_key = disease_name.strip().casefold()
-    disease_data = data[data["Disease"].str.casefold() == disease_key].copy()
-
-    if disease_data.empty:
-        return {"error": "No data found for this disease"}
-
-    series = build_time_series(disease_data)
-    matched_disease = disease_data["Disease"].iloc[0]
-    return build_prediction_result(
-        series,
-        matched_disease,
-        forecast_days=forecast_days,
-        readiness_profile=DISEASE_READINESS_PROFILE,
-    )
-
-
-def predict_barangay_disease(data: pd.DataFrame, barangay_name: str, disease_name: str, forecast_days: int = 7):
-    if data.empty:
-        return {"error": "No data found for this barangay and disease"}
-
-    barangay_key = barangay_name.strip().casefold()
-    disease_key = disease_name.strip().casefold()
-
-    filtered_data = data[
-        (data["Barangay"].str.casefold() == barangay_key)
-        & (data["Disease"].str.casefold() == disease_key)
-    ].copy()
-
-    if filtered_data.empty:
-        return {"error": "No data found for this barangay and disease"}
-
-    series = build_time_series(filtered_data)
-    matched_barangay = filtered_data["Barangay"].iloc[0]
-    matched_disease = filtered_data["Disease"].iloc[0]
-    return build_prediction_result(
-        series,
-        matched_disease,
-        matched_barangay,
-        forecast_days,
-        readiness_profile=BARANGAY_DISEASE_READINESS_PROFILE,
-    )
-
-
-def save_prediction_to_db(prediction_result):
-    conn = get_connection()
-
-    try:
-        table_name = get_existing_table_name(
-            conn,
-            ["predictiveanalysis", "predictiveanalyses", "predictive_analysis"],
-        )
-
-        if not table_name:
-            raise HTTPException(status_code=500, detail="Predictive analysis table was not found.")
-
-        columns = get_table_columns(conn, table_name)
-        location_column = "Barangay" if "Barangay" in columns else "HighRiskBarangay" if "HighRiskBarangay" in columns else None
-
-        if not location_column:
-            raise HTTPException(status_code=500, detail="No barangay column exists in the predictive analysis table.")
-
-        values = {
-            "DateGenerated": datetime.utcnow(),
-            "Disease": prediction_result["disease"],
-            "PredictedCases": prediction_result["predicted_cases"],
-            "ConfidenceScore": prediction_result["confidence_ratio"],
-            "RiskLevel": prediction_result["overall_risk_level"],
-            "Trend": prediction_result["trend"],
-            "Barangay": prediction_result.get("barangay", "Unknown"),
-            "HighRiskBarangay": prediction_result.get("barangay", "Unknown"),
-        }
-
-        insert_columns = [column for column in values if column in columns]
-
-        if not insert_columns:
-            raise HTTPException(status_code=500, detail="No compatible predictive analysis columns were found.")
-
-        cursor = conn.cursor(dictionary=True)
-
-        try:
-            cursor.execute(
-                f"""
-                    SELECT 1
-                    FROM `{table_name}`
-                    WHERE DATE(DateGenerated) = %s
-                      AND LOWER(Disease) = LOWER(%s)
-                      AND LOWER(`{location_column}`) = LOWER(%s)
-                    LIMIT 1
-                """,
-                (
-                    values["DateGenerated"].date(),
-                    values["Disease"],
-                    values[location_column],
-                ),
-            )
-            record_exists = cursor.fetchone() is not None
-
-            if record_exists:
-                set_clause = ", ".join(f"`{column}` = %s" for column in insert_columns)
-                update_values = [values[column] for column in insert_columns]
-                update_values.extend(
-                    [
-                        values["DateGenerated"].date(),
-                        values["Disease"],
-                        values[location_column],
-                    ]
-                )
-
-                cursor.execute(
-                    f"""
-                        UPDATE `{table_name}`
-                        SET {set_clause}
-                        WHERE DATE(DateGenerated) = %s
-                          AND LOWER(Disease) = LOWER(%s)
-                          AND LOWER(`{location_column}`) = LOWER(%s)
-                    """,
-                    update_values,
-                )
-                action = "updated"
-            else:
-                placeholders = ", ".join(["%s"] * len(insert_columns))
-                column_clause = ", ".join(f"`{column}`" for column in insert_columns)
-                insert_values = [values[column] for column in insert_columns]
-
-                cursor.execute(
-                    f"INSERT INTO `{table_name}` ({column_clause}) VALUES ({placeholders})",
-                    insert_values,
-                )
-                action = "saved"
-
-            conn.commit()
-        finally:
-            cursor.close()
-    finally:
-        conn.close()
-
-    return {"status": action, "table": table_name}
-
-
-def generate_pdf(prediction_result):
-    buffer = BytesIO()
-    pdf = canvas.Canvas(buffer, pagesize=LETTER)
-
-    _, height = LETTER
-    y = height - 50
-
-    pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(50, y, "PHIMAS Predictive Analysis Report")
-    y -= 30
-
-    pdf.setFont("Helvetica", 11)
-    summary_lines = [
-        f"Date Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"Disease: {prediction_result['disease']}",
-        f"Barangay: {prediction_result.get('barangay', 'All Barangays')}",
-        f"Predicted Cases (next 7 days): {prediction_result['predicted_cases']}",
-        f"Trend: {prediction_result['trend']}",
-        f"Overall Risk Level: {prediction_result['overall_risk_level']}",
-        f"Confidence Score: {prediction_result['confidence_score']}%",
-    ]
-
-    for line in summary_lines:
-        pdf.drawString(50, y, line)
-        y -= 18
-
-    y -= 10
-    pdf.setFont("Helvetica-Bold", 12)
-    pdf.drawString(50, y, "Forecast Details")
-    y -= 20
-    pdf.setFont("Helvetica", 11)
-
-    for forecast_date, value, risk in zip(
-        prediction_result["forecast_dates"],
-        prediction_result["forecast"],
-        prediction_result["risk_levels"],
-    ):
-        pdf.drawString(50, y, f"{forecast_date}: {value} cases | Risk: {risk}")
-        y -= 18
-
-        if y < 50:
-            pdf.showPage()
-            y = height - 50
-            pdf.setFont("Helvetica", 11)
-
-    pdf.save()
-    buffer.seek(0)
-    return buffer
-
-
-def sanitize_filename(value: str):
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip())
-    return cleaned.strip("_") or "report"
-
-
-@app.get("/")
-def root():
-    return {"message": "PHIMAS Predictive API is running"}
-
-
-@app.get("/predict/{disease}")
-def predict(disease: str, forecast_days: int = Query(default=7, ge=1, le=30)):
-    data = get_data(disease_name=disease)
-    return predict_disease(data, disease, forecast_days)
-
-
-@app.get("/predict/{barangay}/{disease}")
-def predict_by_barangay(barangay: str, disease: str, forecast_days: int = Query(default=7, ge=1, le=30)):
-    data = get_data(barangay_name=barangay, disease_name=disease)
-    return predict_barangay_disease(data, barangay, disease, forecast_days)
-
-
-@app.get("/predict_all")
-def predict_all(forecast_days: int = Query(default=7, ge=1, le=30)):
     data = get_data()
 
-    if data.empty:
-        return []
+    if barangay:
+        filtered = data[
+            (data["Disease"].str.lower() == disease.lower()) &
+            (data["Barangay"].str.lower() == barangay.lower())
+        ]
+    else:
+        filtered = data[
+            data["Disease"].str.lower() == disease.lower()
+        ]
 
-    diseases = sorted(data["Disease"].dropna().unique())
-    results = []
+    if filtered.empty:
+        raise HTTPException(status_code=404, detail="No data found")
 
-    for disease in diseases:
-        result = predict_disease(data, disease, forecast_days)
-        if "error" not in result:
-            results.append(result)
+    ts = filtered.groupby("DateRecorded")["Cases"].sum()
 
-    return results
+    forecast = predict_cases(ts, disease, barangay)
 
-
-@app.get("/predict-and-save/{barangay}/{disease}")
-def predict_and_save(barangay: str, disease: str, forecast_days: int = Query(default=7, ge=1, le=30)):
-    data = get_data(barangay_name=barangay, disease_name=disease)
-    result = predict_barangay_disease(data, barangay, disease, forecast_days)
-
-    if "error" in result:
-        return result
-
-    save_result = save_prediction_to_db(result)
-    result["save_status"] = save_result["status"]
-    result["saved_to"] = save_result["table"]
-
-    return result
-
-
-@app.get("/report/{barangay}/{disease}")
-def report(barangay: str, disease: str, forecast_days: int = Query(default=7, ge=1, le=30)):
-    data = get_data(barangay_name=barangay, disease_name=disease)
-    result = predict_barangay_disease(data, barangay, disease, forecast_days)
-
-    if "error" in result:
-        return result
-
-    pdf_buffer = generate_pdf(result)
-    safe_barangay = sanitize_filename(result.get("barangay", barangay))
-    safe_disease = sanitize_filename(result["disease"])
-    filename = f"{safe_barangay}_{safe_disease}_report.pdf"
-
-    return StreamingResponse(
-        pdf_buffer,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return {
+        "disease": disease,
+        "barangay": barangay,
+        "forecast": forecast
+    }
